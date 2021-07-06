@@ -1,0 +1,401 @@
+// Seconds before shutting off the Power supply after light turned off
+#define SECS_BEFORE_OFF 20
+
+// Number of Milight groups
+#define NB_DEV 8
+// GroupId on the Midlight Gateway per output
+char devGrp[NB_DEV]  = { 1, 2, 3, 4, 1, 2, 3, 4  };
+
+// Number of Milight Gateways
+#define NB_GW 2
+// Milight Gateway id per output
+char devGw[NB_DEV]   = { 0, 0, 0, 0, 1, 1, 1, 1 };
+
+
+#define W_MARK 200000000
+
+unsigned short bitMasks[] = { 0x0001, 0x0002, 0x0004, 0x0008, 0x00010, 0x0020, 0x0040, 0x0080, 0x0100, 0x0200, 0x0400, 0x0800, 0x1000 };
+unsigned short outStates = 0;
+
+#define M_UNK -1
+#define M_OFF 0
+#define M_RGB 1
+#define M_WHITE 2
+#define M_ALARM 3
+
+// Current state of the Milight output
+char devMode[NB_DEV] = { M_UNK, M_UNK, M_UNK, M_UNK, M_UNK, M_UNK, M_UNK, M_UNK };
+char devBri[NB_DEV];
+char devHue[NB_DEV];
+char devKelSat[NB_DEV];
+
+// ------------ Gateway data, adapt if you change NB_GW
+
+unsigned int sessExp[NB_GW]  = { 0, 0 };
+char sess1[NB_GW]   = { 0, 0 };
+char sess2[NB_GW]   = { 0, 0 };
+char sessSeq[NB_GW] = { 0, 0 };
+
+//--------------
+
+#define SIZE_BLOCK 350
+char *tblHex = "0123456789ABCDEF";
+
+void printBlock(char *prefix, char *data, int size)
+{
+	char block[SIZE_BLOCK + 2];
+
+	sprintf(block, prefix, size);
+	int hdrLen = strlen(block);
+
+	int maxSize = (SIZE_BLOCK - hdrLen) / 3;
+	if (size > maxSize) size = maxSize;
+
+	char *out = &block[hdrLen];
+	while(size > 0) {
+		*out++ = ' ';
+		char val = *data++;
+		*out++ = tblHex[(val >> 4) & 0xF];
+		*out++ = tblHex[val & 0xF];
+		size--;
+	}
+	*out++ = '\n';
+	*out++ = 0;
+	printf(block);
+}
+
+//-------------- Send UDP payload and read reply
+
+int UDPOutIn(char gwId, char *outData, int outSize, char *inData, int *inSize, int inTimeout) {
+
+//	if (DEBUG_LEV) printBlock("IN : %d -", outData, outSize);
+
+	char *gwURL;
+	switch(gwId) {
+		case 0:
+			gwURL = "/dev/udp/192.168.1.190/5987";
+			break;
+
+		case 1:
+			gwURL = "/dev/udp/192.168.1.191/5987";
+			break;
+	};
+
+    STREAM *Socket = stream_create(gwURL,0,0);
+    if (Socket == NULL) {
+		printf("Can t create UDP session to %s", gwURL);
+		return -997;
+	}
+
+    stream_write(Socket, outData, outSize);
+    stream_flush(Socket);
+
+    *inSize = stream_read(Socket, inData, *inSize, inTimeout);
+
+    stream_close(Socket);
+
+//	if (DEBUG_LEV) printBlock("OUT : %d -", inData, *inSize);
+
+    return 0;
+}
+
+//-------------- Send command to Gateway, manage Sessions
+
+#define SIZE_BUF 32
+
+char HELLO[] = { 0x20, 0x00, 0x00, 0x00, 0x16, 0x02, 0x62, 0x3A, 0xD5, 0xED, 0xA3, 0x01, 0xAE, 0x08, 0x2D, 0x46, 0x61, 0x41, 0xA7, 0xF6, 0xDC, 0xAF, 0xD3, 0xE6, 0x00, 0x00, 0x1E };
+// Command to send : 0xF0 Session, 0xF1 Seq#, 0xF2: Actual Command, 0xF3 Group, 0xF4 CRC
+char CMD[] = { 0x80,0x00,0x00,0x00,0x11,0xF0,0xF0,0x00,0xF1,0x00,0x31,0x00,0x00,0x08,0xF2,0xF2,0xF2,0xF2,0xF2,0xF3,0x00,0xF4 };
+
+int sendCmd(unsigned short devId, char *cmd) {
+    char buffer[SIZE_BUF];
+	int ret = 0;
+	int outSize;
+
+	char gwId = devGw[devId];
+	if (sessExp[gwId] < now) {
+//		printf("Session expired %d s. ago. %d\n", sessExp[gwId] - now, gwId);
+
+		outSize = SIZE_BUF;
+		ret = UDPOutIn(gwId, HELLO, sizeof(HELLO), buffer, &outSize, 500);
+		if (ret != 0 || outSize <= 20) {
+			printf("ERROR : getting Milight session err: %d,%d,%d", ret, outSize, gwId);
+			return -996;
+		}
+		sess1[gwId] = buffer[19];
+		sess2[gwId] = buffer[20];
+
+//		printf("Got session %x%x %d,%d\n", sess1[gwId], sess2[gwId], sessExp[gwId], devId);
+	}
+	sessExp[gwId] = now + 60;
+
+	CMD[5] = sess1[gwId];
+	CMD[6] = sess2[gwId];
+	CMD[8] = ++sessSeq[gwId];
+
+	int crc = 0x39;  // Precalulated from 0x31,0x00,0x00,0x08
+	char *out = &CMD[14];
+    char *endCmd = &cmd[5];
+	while(cmd != endCmd) {
+		char byte = *cmd++;
+		*out++ = byte;
+		crc += ((int)byte) & 0xFF;
+	}
+	*out++ = devGrp[devId];
+	crc += devGrp[devId];
+	*++out = crc;
+
+	outSize = SIZE_BUF;
+	ret = UDPOutIn(gwId, CMD, 22, buffer, &outSize, 200);
+	if (ret != 0 || outSize < 8 || buffer[7] != 0) {
+		printf("ERROR : Sending command : %d,%d,%d\n", ret, buffer[7], devId);
+		sessExp[gwId] = 0;
+	}
+
+	return ret;
+}
+
+//-------------- Send Command whith 2 retries in case of error
+
+int sendCommand(unsigned short devId, char *cmd) {
+	int ret;
+	unsigned short count = 3;
+	while(count--) {
+		ret = sendCmd(devId, cmd);
+		if (ret == 0) break;
+		printf("Error : retrying : %d - %d\n", devId, ret);
+		}
+	return ret;
+}
+
+//-------------- Turn off output devices
+
+void delayedTurnOff() {
+
+	unsigned short devId = NB_DEV;
+	while(devId != 0) {
+		if (now >= nextOffTimes[--devId]) {
+//			printf("OFF %d\n", devId);
+			setoutput(devId, 0);
+			nextOffTimes[devId] = NEVER;
+		}
+	}
+}
+
+//-------------- Manage power
+
+void setOutputs(unsigned short devId, char onOff) {
+
+//	printf("Output %d to %d\n", devId, onOff);
+
+	int mask = bitMasks[devId];
+	if (outStates & mask) {
+		if (!onOff) {
+			outStates = outStates & ~mask;
+			nextOffTimes[devId] = now + SECS_BEFORE_OFF;
+		}
+	} else {
+		if (onOff) {
+			outStates |= mask;
+			if (nextOffTimes[devId] == NEVER) {
+//				printf("ON %d\n", devId);
+				setoutput(devId, 1);
+//				printf("Sleeping for warmup\n");
+				sleep(1000);
+				now = getcurrenttime();
+//				printf("Warmed !\n");
+			} else nextOffTimes[devId] = NEVER;
+		}
+	}
+}
+
+//--------------
+char ON[]     = { 0x04, 0x01, 0x00, 0x00, 0x00 };
+char OFF[]    = { 0x04, 0x02, 0x00, 0x00, 0x00 };
+// Blinking red
+char ALARM[]  = { 0x06, 0x07, 0x00, 0x00, 0x00 };
+// BrightNess (0xFF -> hex values 0x00 to 0x64 : examples: 00 = 0%, 19 = 25%, 32 = 50%, 4B, = 75%, 64 = 100%)
+char BRIGHT[] = { 0x03, 0xFF, 0x00, 0x00, 0x00 };
+// Kelvin (0xFF -> hex values 0x00 to 0x64 : examples: 00 = 2700K (Warm White), 19 = 3650K, 32 = 4600K, 4B, = 5550K, 64 = 6500K (Cool White))
+char KELVIN[] = { 0x05, 0xFF, 0x00, 0x00, 0x00 };
+ // Saturation (0xFF -> hex values 0x00 to 0x64 : examples: 00 = 0%, 19 = 25%, 32 = 50%, 4B, = 75%, 64 = 100%)
+char SAT[]    = { 0x02, 0xFF, 0x00, 0x00, 0x00 };
+ // Set Hue to Blue 0xFF -> hex values 0x00 to 0xFF : examples : 0xFF = Red, D9 = Lavender, BA = Blue, 85 = Aqua, 7A = Green, 54 = Lime, 3B = Yellow, 1E = Orange
+char HUE[]    = { 0x01, 0xFF, 0x00, 0x00, 0x00 };
+//--------------
+
+void off(unsigned short devId) {
+	if (devBri[devId] > 15) {
+		BRIGHT[1] = 0;
+		sendCommand(devId, BRIGHT);  // Dim color to 0 to avoid flash when turning on
+	}
+	sendCommand(devId, OFF);
+	setOutputs(devId, 0);
+	devMode[devId] = M_OFF;
+}
+
+//--------------
+
+unsigned char setMode(unsigned short devId, unsigned short mode) {
+
+	setOutputs(devId, 1);
+	if (devMode[devId] == mode) return 0;
+
+	if (devMode[devId] != M_OFF) {
+		BRIGHT[1] = 0;
+		sendCommand(devId, BRIGHT);  // Dim to 0 to avoid flash
+	} else sendCommand(devId, ON);
+	devMode[devId] = mode;
+	return 1;
+}
+
+//--------------
+
+void setAlarm(unsigned short devId) {
+	setMode(devId, M_ALARM);
+	sendCommand(devId, ALARM);
+	BRIGHT[1] = 100;
+	sendCommand(devId, BRIGHT);
+}
+
+//--------------
+
+void setWhite(unsigned short devId, unsigned short bri, unsigned short kel) {
+
+//	printf("White %d, %d\n", kel, bri);
+
+	if (bri != 0) {
+		if (setMode(devId, M_WHITE)) devBri[devId] = devKelSat[devId] = M_UNK;
+
+		if (kel != devKelSat[devId]) {
+//			printf("KELVIN %x\n", kel);
+			devKelSat[devId] = KELVIN[1] = kel;
+			sendCommand(devId, KELVIN);
+		}
+		if (bri != devBri[devId]) {
+//			printf("BRIGHTNESS %x\n", bri);
+			devBri[devId] = BRIGHT[1] = bri;
+			sendCommand(devId, BRIGHT);
+		}
+	} else off(devId);
+}
+
+//--------------
+
+void setRGB(unsigned short devId, unsigned short r, unsigned short g, unsigned short b) {
+	unsigned short bri,min,delta;
+
+	//-------------- convert RGB (0-100,0-100,0-100) to HSB (0-255,0-100,0-100)
+	if (r > g) bri = r;
+	else bri = g;
+	if (b > bri) bri = b;
+
+	if (r < g) min = r;
+	else min = g;
+	if (b < min) min = b;
+	delta = bri - min;
+
+	unsigned short sat = 100;
+	if (bri != 0) sat -= (delta * 100) / bri;
+
+	int hue = 0;
+	if (delta != 0) {
+		if (r != bri) {
+			if (g == bri) hue = 120 + (b - r) * 60 / delta;
+			else hue = 240 + (r - g) * 60 / delta;
+		} else hue = (g - b) * 60 / delta;
+		if (hue < 0) hue += 360;
+	}
+	hue = (hue * 255) / 360;
+
+//	printf("RGB : %d,%d,%d - HSB: %x,%x,%x\n", r, g, b, hue, sat, bri);
+
+	if (bri != 0) {
+		if (setMode(devId, M_RGB)) devBri[devId] = devKelSat[devId] = devHue[devId] = M_UNK;
+
+		if (devHue[devId] != hue) {
+//			printf("HUE %d\n", hue);
+			devHue[devId] = HUE[1] = HUE[2] = HUE[3] = HUE[4] = hue;
+			sendCommand(devId, HUE);
+		}
+		if (devBri[devId] != bri) {
+//			printf("BRIGHT %d\n", bri);
+			devBri[devId] = BRIGHT[1] = bri;
+			sendCommand(devId, BRIGHT);
+		}
+		if (devKelSat[devId] != sat) {
+//			printf("SAT %d\n", sat);
+			devKelSat[devId] = SAT[1] = sat;
+			sendCommand(devId, SAT);
+		}
+	} else off(devId);
+}
+
+//--------------
+
+#define I_NO 0
+#define I_DIM 1
+#define I_LUMI 2
+#define I_ALARM 3
+
+// Assign input type : Lumitech, Dimmer or Alarm
+char inpType[13] = { I_DIM, I_DIM, I_DIM, I_DIM, I_DIM, I_DIM, I_DIM, I_DIM, I_NO, I_NO, I_NO, I_NO, I_ALARM };
+
+#define NEVER 0x7FFFFFFF
+unsigned int nextOffTimes[NB_DEV] = { NEVER, NEVER, NEVER, NEVER, NEVER, NEVER, NEVER, NEVER };
+unsigned int now;
+
+int burstCount = 0;
+
+while(1) {
+	unsigned short inpId = 0;
+	now = getcurrenttime();
+	int evtMask = (getinputevent() >> 3) & 0x1FFF;
+	while(evtMask != 0){
+		int bitMask = bitMasks[inpId];
+		if (evtMask & bitMask) {
+			evtMask ^= bitMask;
+			int value = getinput(inpId);
+			switch(inpType[inpId]) {
+				case I_DIM:
+					setWhite(inpId, value, 20);
+					break;
+
+				case I_LUMI:
+//					printf("Lumitech device %d to %d\n", inpId, value);
+
+					int val = value % W_MARK;
+					if (val == value) {
+						// RGB : 48040080 means R80% G40% B48%
+						unsigned short blue = val / 1000000;
+						val -= blue * 1000000;
+						unsigned short green  = val / 1000;
+						setRGB(inpId, val - green * 1000, green, blue);
+					} else {
+						// White mode -> 201004210 means 100% 4210K (2700k to 6500k)
+						setWhite(inpId, val / 10000, ((val % 10000) - 2700) / 38);
+					}
+					break;
+				case I_ALARM:
+					for(inpId = 0; inpId < NB_DEV; inpId++) {
+						if (value) setAlarm(inpId);
+						else setWhite(inpId, 0, 20);
+					}
+					break;
+				}
+			burstCount += 10;
+			}
+		inpId++;
+	}
+
+	delayedTurnOff();
+
+	if (burstCount) {
+		burstCount--;
+		sleep(60);
+	}
+	else sleep(300);
+}
+
+//--------------
+
